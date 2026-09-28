@@ -1,0 +1,77 @@
+name: Watch SIRI appointment slots
+
+on:
+  schedule:
+    # Odd minute on purpose: GitHub's scheduler is a best-effort queue and is
+    # heavily delayed at the top of the hour, where everyone's cron piles up.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: 'How long to watch, in minutes (max ~350; job hard-caps at 360)'
+        required: false
+        default: '55'
+      poll_interval:
+        description: 'Seconds between polls'
+        required: false
+        default: '60'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: siri-slot-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      STATE_FILE: state.json
+      RUN_MINUTES: ${{ github.event.inputs.run_minutes || '55' }}
+      POLL_INTERVAL: ${{ github.event.inputs.poll_interval || '60' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Restore state
+        continue-on-error: true
+        run: |
+          if git fetch --depth=1 origin watcher-state; then
+            git show FETCH_HEAD:state.json > state.json
+            echo "restored state.json"
+          else
+            echo "no prior state, starting fresh"
+          fi
+
+      - name: Watch for new slots
+        run: uv run python watcher.py --max-runtime "$RUN_MINUTES"
+
+      - name: Persist state
+        if: always()
+        env:
+          STATE_BRANCH: watcher-state
+        run: |
+          set -euo pipefail
+          [ -f state.json ] || { echo "no state to persist"; exit 0; }
+          tmp="$(mktemp -d)"
+          cp state.json "$tmp/"
+          cd "$tmp"
+          git init -q
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          git -c commit.gpgsign=false commit -q -m "watcher state $(date -u +%FT%TZ)"
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${STATE_BRANCH}"
+          echo "state pushed to ${STATE_BRANCH}"
