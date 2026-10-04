@@ -54,6 +54,8 @@ jobs:
           # single commit. Pushes through origin, reusing the credential
           # actions/checkout configured, and -f because state-*.json is gitignored.
           # git reset clears the index so only the state files land in the commit.
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
           git checkout --orphan watcher-state
           git reset --quiet
           git add -f -- "${files[@]}"
