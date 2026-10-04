@@ -30,7 +30,6 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      STATE_FILE: state.json
       RUN_MINUTES: ${{ github.event.inputs.run_minutes || '55' }}
       POLL_INTERVAL: ${{ github.event.inputs.poll_interval || '60' }}
     steps:
@@ -47,8 +46,14 @@ jobs:
         continue-on-error: true
         run: |
           if git fetch --depth=1 origin watcher-state; then
-            git show FETCH_HEAD:state.json > state.json
-            echo "restored state.json"
+            found=0
+            while read -r f; do
+              [ -n "$f" ] || continue
+              git show "FETCH_HEAD:$f" > "$f" && { echo "restored $f"; found=1; }
+            done <<EOF
+          $(git show FETCH_HEAD --name-only --pretty=format: | grep '^state' || true)
+          EOF
+            [ "$found" = 1 ] || echo "state branch had no state files"
           else
             echo "no prior state, starting fresh"
           fi
@@ -61,17 +66,23 @@ jobs:
         env:
           STATE_BRANCH: watcher-state
         run: |
-          set -euo pipefail
-          [ -f state.json ] || { echo "no state to persist"; exit 0; }
+          set -eo pipefail
+          shopt -s nullglob
+          files=(state-*.json)
+          [ -f state.json ] && files+=(state.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no state to persist"
+            exit 0
+          fi
           tmp="$(mktemp -d)"
-          cp state.json "$tmp/"
+          cp "${files[@]}" "$tmp/"
           cd "$tmp"
           git init -q
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add state.json
+          git add .
           git -c commit.gpgsign=false commit -q -m "watcher state $(date -u +%FT%TZ)"
           git push --force \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/${STATE_BRANCH}"
-          echo "state pushed to ${STATE_BRANCH}"
+          echo "state pushed to ${STATE_BRANCH}: ${files[*]}"

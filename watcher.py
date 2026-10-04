@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Watch the SIRI Copenhagen booking page and alert on newly released appointment slots.
+"""Watch SIRI Copenhagen appointment booking pages and alert on newly released slots.
 
-The reservation site is an ASP.NET MVC flow whose TimeSelection page is only
-rendered when the request carries a server-side ``ReserveTimeState`` cookie. The
-page cannot be fetched directly; it must be reached by starting the flow, so
-every poll replays ``StartReservation`` from a clean cookie jar.
+Two independent booking systems are supported:
+
+* **FrontDeskSuite** (Nyropsgade) is an ASP.NET MVC flow whose TimeSelection page
+  is only rendered when the request carries a server-side ``ReserveTimeState``
+  cookie. The page cannot be fetched directly, so every poll replays
+  ``StartReservation`` from a clean cookie jar.
+* **CleverQ** (Carl Jacobsens Vej) is a JSON API gated by a Rails session cookie
+  plus a CSRF token, both issued by loading the booking page. Availability must
+  then be queried one day at a time, so it costs more requests per poll.
 """
 
 from __future__ import annotations
@@ -16,9 +21,10 @@ import os
 import random
 import re
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from bs4 import BeautifulSoup
@@ -28,16 +34,6 @@ load_dotenv()
 
 log = logging.getLogger("watcher")
 
-BASE_URL = "https://reservation.frontdesksuite.com"
-SITE = "kk/SIRI%20Copenhagen"
-PAGE_ID = "2dcd2a7a-e666-4cf2-86d2-e035a8a638ee"
-BUTTON_ID = "a4b27a7d-15e6-4420-bc1e-176f58fe5f92"
-
-START_URL = (
-    f"{BASE_URL}/{SITE}/ReserveTime/StartReservation"
-    f"?pageId={PAGE_ID}&buttonId={BUTTON_ID}&culture=en&uiCulture=en"
-)
-
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -46,11 +42,39 @@ USER_AGENT = (
 SUPERSCRIPT_RE = re.compile(r"[\u00b2\u00b3\u00b9\u02b0-\u02ff\u1d2c-\u1dbf\u2070-\u209f]")
 SPACE_RE = re.compile(r"\s+")
 SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:])")
+CSRF_RE = re.compile(r'name="csrf-token"\s+content="([^"]+)"')
 
 DEFAULT_INTERVAL = 60.0
 DEFAULT_HEARTBEAT_HOURS = 24.0
 DEFAULT_TIMEOUT = 30.0
 NOTIFY_TIMEOUT = 15.0
+
+# --- FrontDeskSuite: SIRI Copenhagen, Nyropsgade 1 ---
+FDS_BASE = "https://reservation.frontdesksuite.com"
+FDS_SITE = "kk/SIRI%20Copenhagen"
+FDS_PAGE_ID = "2dcd2a7a-e666-4cf2-86d2-e035a8a638ee"
+FDS_BUTTON_ID = "a4b27a7d-15e6-4420-bc1e-176f58fe5f92"
+FDS_START_URL = (
+    f"{FDS_BASE}/{FDS_SITE}/ReserveTime/StartReservation"
+    f"?pageId={FDS_PAGE_ID}&buttonId={FDS_BUTTON_ID}&culture=en&uiCulture=en"
+)
+
+# --- CleverQ: SIRI Copenhagen, Carl Jacobsens Vej 39 ---
+CQ_BASE = "https://scandic.cleverq.de"
+CQ_SITE_ID = "3"
+CQ_BOOKING_PAGE = f"{CQ_BASE}/public/appointments/jacobsens/index.html?lang=en"
+CQ_API = f"{CQ_BASE}/api/external/v4/sites/{CQ_SITE_ID}/appointments"
+CQ_SERVICE_ID = 20  # "Ansøger efter EU-reglerne" (apply under EU regulations)
+CQ_DAYS_AHEAD = 60  # the site clamps its own booking window to ~40 days regardless
+# The site has "appointments_use_subtasks": true, so the real subtask id must be sent
+# or the API silently answers with every day marked open and zero availability on all
+# of them. Ids 46/47/48 all belong to service 20 and return identical availability;
+# an id outside that set is the failure mode above, so do not change this blindly.
+CQ_SUBTASK_ID = 46  # "Jeg vil ansøge om ophold efter EU-reglerne"
+CQ_SUBTASK = {
+    "subtask_items[][subtask_id]": str(CQ_SUBTASK_ID),
+    "subtask_items[][number]": "1",  # one person
+}
 
 
 class FlowError(RuntimeError):
@@ -73,7 +97,7 @@ def normalize(text: str) -> str:
     return SPACE_BEFORE_PUNCT_RE.sub(r"\1", SPACE_RE.sub(" ", stripped)).strip()
 
 
-def parse_slots(html: str) -> list[Slot]:
+def parse_fds_slots(html: str) -> list[Slot]:
     """Extract every bookable slot from a rendered TimeSelection page.
 
     A date is considered open only when it renders ``.time button`` elements,
@@ -91,26 +115,120 @@ def parse_slots(html: str) -> list[Slot]:
         header = block.select_one(".header-text")
         if header is None:
             continue
-        date = normalize(header.get_text(" ", strip=True))
-        if not date:
+        date_label = normalize(header.get_text(" ", strip=True))
+        if not date_label:
             continue
         for button in block.select(".times-list .time button"):
             time_label = normalize(button.get_text(" ", strip=True))
             if time_label:
-                slots.append(Slot(date=date, time=time_label))
+                slots.append(Slot(date=date_label, time=time_label))
     return slots
 
 
-def fetch_slots(timeout: float) -> list[Slot]:
-    """Run the booking flow from a clean session and return the current slots."""
+def fetch_fds_slots(timeout: float) -> list[Slot]:
+    """Run the FrontDeskSuite booking flow from a clean session."""
     with httpx.Client(
         follow_redirects=True,
         timeout=timeout,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "en"},
     ) as client:
-        response = client.get(START_URL)
+        response = client.get(FDS_START_URL)
         response.raise_for_status()
-        return parse_slots(response.text)
+        return parse_fds_slots(response.text)
+
+
+def parse_cq_slots(day: str, payload: dict) -> list[Slot]:
+    """Bookable slots for one day. ``available > 0`` is the only reliable signal."""
+    slots: list[Slot] = []
+    for entry in payload.get("available_time_slots", []):
+        if entry.get("available", 0) > 0 and entry.get("time_of_slot"):
+            slots.append(Slot(date=day, time=str(entry["time_of_slot"])))
+    return slots
+
+
+def fetch_cq_slots(timeout: float) -> list[Slot]:
+    """Query the CleverQ API for every open day in the booking window.
+
+    Costs 2 + N requests (N = open days), so it suits a slower poll interval
+    than FrontDeskSuite.
+    """
+    slots: list[Slot] = []
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=timeout,
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "en"},
+    ) as client:
+        page = client.get(CQ_BOOKING_PAGE)
+        page.raise_for_status()
+        csrf = CSRF_RE.search(page.text)
+        if csrf is None:
+            raise FlowError("no CSRF token on the CleverQ booking page")
+        headers = {"X-CSRF-TOKEN": csrf.group(1), "Accept": "application/json"}
+
+        today = date.today()
+        params = {
+            "service_id": CQ_SERVICE_ID,
+            "from_day": today.isoformat(),
+            "to_day": (today + timedelta(days=CQ_DAYS_AHEAD)).isoformat(),
+            "mode_active": "true",
+            **CQ_SUBTASK,
+        }
+        response = client.get(f"{CQ_API}/available_days", params=params, headers=headers)
+        response.raise_for_status()
+        days = [d["day"] for d in response.json().get("available_days", [])]
+        log.debug("CleverQ reports %d open day(s)", len(days))
+
+        for day in days:
+            response = client.get(
+                f"{CQ_API}/available_time_slots",
+                params={
+                    "service_id": CQ_SERVICE_ID,
+                    "day": day,
+                    "show_all": "true",
+                    **CQ_SUBTASK,
+                },
+                headers=headers,
+            )
+            response.raise_for_status()
+            slots.extend(parse_cq_slots(day, response.json()))
+
+    if days and not slots:
+        # An unusable subtask_id looks exactly like "fully booked": every day is
+        # reported open but no slot is bookable. Worth saying out loud.
+        log.warning(
+            "CleverQ reported %d open day(s) but no bookable slot; if this "
+            "persists, re-check CQ_SUBTASK_ID against the site's /sites/3 payload",
+            len(days),
+        )
+    return slots
+
+
+@dataclass(frozen=True)
+class Site:
+    key: str
+    label: str
+    booking_url: str
+    fetcher: Callable[[float], list[Slot]]
+    interval: float = DEFAULT_INTERVAL
+    earliest_only: bool = False
+
+
+SITES: dict[str, Site] = {
+    "nyropsgade": Site(
+        key="nyropsgade",
+        label="SIRI Copenhagen - Nyropsgade (CPR)",
+        booking_url=FDS_START_URL,
+        fetcher=fetch_fds_slots,
+    ),
+    "carljacobsens": Site(
+        key="carljacobsens",
+        label="SIRI Copenhagen - Carl Jacobsens Vej (EU residence)",
+        booking_url=CQ_BOOKING_PAGE,
+        fetcher=fetch_cq_slots,
+        interval=180.0,
+        earliest_only=True,
+    ),
+}
 
 
 class TelegramError(RuntimeError):
@@ -203,9 +321,146 @@ def format_slots(slots: list[Slot], heading: str) -> str:
         by_date.setdefault(slot.date, []).append(slot.time)
 
     lines = [heading]
-    for date, times in by_date.items():
-        lines.append(f"{date}: {', '.join(sorted(times))}")
+    for day, times in by_date.items():
+        lines.append(f"{day}: {', '.join(sorted(times))}")
     return "\n".join(lines)
+
+
+def render_slots(site: Site, slots: list[Slot], heading: str) -> str:
+    """Body of a notification about ``slots``.
+
+    CleverQ opens hundreds of 5-minute slots at once, so listing every one of them
+    is unreadable. For a site marked ``earliest_only`` the message carries just the
+    first bookable date. Callers pass the full set of currently open slots there,
+    so every message reports the best date on offer rather than the best date among
+    the newly seen ones.
+    """
+    if not site.earliest_only:
+        return format_slots(slots, heading)
+
+    summary = heading.rstrip(":")
+    if slots:
+        summary += f" — earliest available date {min(slot.date for slot in slots)}"
+    return summary
+
+
+@dataclass
+class Tracker:
+    """Per-site polling state, persisted between runs."""
+
+    seen: set[str] = field(default_factory=set)
+    last_heartbeat: str | None = None
+    first_run: bool = True
+    failures: int = 0
+    next_poll: float = 0.0
+
+
+def state_path_for(site: Site, args: argparse.Namespace, count: int) -> Path:
+    if args.state_file is not None and count == 1:
+        return args.state_file
+    if args.state_dir is not None:
+        return args.state_dir / f"state-{site.key}.json"
+    return Path(f"state-{site.key}.json")
+
+
+def resolve_sites(requested: str) -> list[Site]:
+    keys = [k.strip() for k in requested.split(",") if k.strip()]
+    if not keys or keys == ["all"]:
+        return list(SITES.values())
+    unknown = [k for k in keys if k not in SITES]
+    if unknown:
+        raise SystemExit(
+            f"unknown site(s): {', '.join(unknown)}. Choose from: {', '.join(SITES)}"
+        )
+    return [SITES[k] for k in keys]
+
+
+def poll_site(
+    site: Site,
+    tracker: Tracker,
+    path: Path,
+    interval: float,
+    heartbeat_hours: float,
+    notify: bool,
+) -> bool:
+    """Poll one site once. Returns True on success."""
+    try:
+        slots = site.fetcher(DEFAULT_TIMEOUT)
+    except (httpx.HTTPError, FlowError) as exc:
+        tracker.failures += 1
+        delay = min(interval * (2 ** min(tracker.failures, 5)), 900)
+        log.error("[%s] poll failed (%s); retrying in %.0fs", site.key, exc, delay)
+        tracker.next_poll = time.monotonic() + delay
+        return False
+
+    if tracker.failures:
+        log.info("[%s] recovered after %d failed poll(s)", site.key, tracker.failures)
+    tracker.failures = 0
+
+    current = {slot.key for slot in slots}
+    new_keys = current - tracker.seen
+
+    baseline = tracker.first_run
+    tracker.first_run = False
+    delivered = True
+
+    def send(body: str) -> bool:
+        return deliver(f"{site.label}\n{body}\n\nBook here: {site.booking_url}")
+
+    if baseline:
+        log.info("[%s] baseline recorded: %d slot(s) open", site.key, len(slots))
+        if notify:
+            delivered = send(
+                render_slots(site, slots, f"Watcher started. {len(slots)} slot(s) open:")
+            )
+    elif new_keys:
+        new_slots = [slot for slot in slots if slot.key in new_keys]
+        # Only the affected days: a single release can add hundreds of 5-minute
+        # slots, and listing every one floods the logs.
+        log.info(
+            "[%s] %d new slot(s) on %s",
+            site.key,
+            len(new_slots),
+            ", ".join(sorted({slot.date for slot in new_slots})),
+        )
+        if notify:
+            # An earliest_only site reports the best date currently bookable, which
+            # is not necessarily among the slots that just appeared.
+            shown = slots if site.earliest_only else new_slots
+            delivered = send(
+                render_slots(site, shown, f"{len(new_slots)} NEW slot(s) available:")
+            )
+
+    if delivered:
+        tracker.seen |= current
+    save_state(
+        path, {"seen": sorted(tracker.seen), "last_heartbeat": tracker.last_heartbeat}
+    )
+
+    heartbeat_due = (
+        tracker.last_heartbeat is None
+        or now() - datetime.fromisoformat(tracker.last_heartbeat)
+        >= timedelta(hours=heartbeat_hours)
+    )
+    if heartbeat_due:
+        if notify and not baseline:
+            delivered = send(
+                render_slots(site, slots, f"Status: {len(slots)} slot(s) open:")
+                if slots
+                else "Status: no slots open right now."
+            )
+        if delivered:
+            tracker.last_heartbeat = now().isoformat()
+        save_state(
+            path,
+            {"seen": sorted(tracker.seen), "last_heartbeat": tracker.last_heartbeat},
+        )
+        log.info("[%s] heartbeat: %d slot(s) open", site.key, len(slots))
+
+    tracker.next_poll = time.monotonic() + interval + random.uniform(
+        0, min(5.0, interval * 0.1)
+    )
+    return True
 
 
 def now() -> datetime:
@@ -235,15 +490,25 @@ def missing_credentials() -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    env_interval = os.environ.get("POLL_INTERVAL")
+    parser = argparse.ArgumentParser(
+        description="Watch SIRI Copenhagen booking pages for new appointment slots.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="sites: " + ", ".join(f"{k} ({v.label})" for k, v in SITES.items()),
+    )
     parser.add_argument(
-        "--once", action="store_true", help="poll a single time, then exit"
+        "--site",
+        default=os.environ.get("SITES", "all"),
+        help="comma-separated site keys, or 'all' (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--once", action="store_true", help="poll each selected site once, then exit"
     )
     parser.add_argument(
         "--interval",
         type=float,
-        default=float(os.environ.get("POLL_INTERVAL", DEFAULT_INTERVAL)),
-        help="seconds between polls (default: %(default)s)",
+        default=float(env_interval) if env_interval else None,
+        help="override every site's poll interval, in seconds",
     )
     parser.add_argument(
         "--heartbeat-hours",
@@ -252,10 +517,16 @@ def main() -> int:
         help="hours between status pings (default: %(default)s)",
     )
     parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=Path(os.environ["STATE_DIR"]) if os.environ.get("STATE_DIR") else None,
+        help="directory for per-site state files",
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
-        default=Path(os.environ.get("STATE_FILE", "state.json")),
-        help="where to persist seen slots (default: %(default)s)",
+        default=None,
+        help="explicit state file; only valid when watching a single site",
     )
     parser.add_argument(
         "--max-runtime",
@@ -272,6 +543,11 @@ def main() -> int:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    sites = resolve_sites(args.site)
+    if args.state_file is not None and len(sites) > 1:
+        log.error("--state-file cannot be used with multiple sites; use --state-dir")
+        return 2
+
     absent = missing_credentials()
     if absent and not args.once:
         log.error(
@@ -280,91 +556,51 @@ def main() -> int:
             ", ".join(absent),
         )
         return 2
-
     notify = not absent
-    state = load_state(args.state_file)
-    seen: set[str] = set(state["seen"])
-    last_heartbeat = state["last_heartbeat"]
-    failures = 0
-    first_run = not seen and last_heartbeat is None
+
+    trackers: dict[str, Tracker] = {}
+    for site in sites:
+        path = state_path_for(site, args, len(sites))
+        saved = load_state(path)
+        heartbeat = saved["last_heartbeat"]
+        trackers[site.key] = Tracker(
+            seen=set(saved["seen"]),
+            last_heartbeat=heartbeat,
+            first_run=not saved["seen"] and heartbeat is None,
+            next_poll=0.0,
+        )
+
+    intervals = {
+        site.key: (args.interval if args.interval is not None else site.interval)
+        for site in sites
+    }
     started = time.monotonic()
 
     while True:
-        try:
-            slots = fetch_slots(DEFAULT_TIMEOUT)
-        except (httpx.HTTPError, FlowError) as exc:
-            failures += 1
-            delay = min(args.interval * (2**min(failures, 5)), 900)
-            log.error("poll failed (%s); retrying in %.0fs", exc, delay)
-            if args.once:
-                return 1
-            time.sleep(delay)
-            continue
-
-        if failures:
-            log.info("recovered after %d failed poll(s)", failures)
-        failures = 0
-
-        current = {slot.key for slot in slots}
-        new_keys = current - seen
-
-        baseline = first_run
-        first_run = False
-
-        delivered = True
-
-        if baseline:
-            log.info("baseline recorded: %d slot(s) currently open", len(slots))
-            if notify:
-                delivered = deliver(
-                    format_slots(
-                        slots, f"Watcher started. {len(slots)} slot(s) open right now:"
-                    )
-                    + f"\n\nBook here: {START_URL}"
+        ok = True
+        for site in sites:
+            tracker = trackers[site.key]
+            if args.once or tracker.next_poll <= time.monotonic():
+                ok &= poll_site(
+                    site,
+                    tracker,
+                    state_path_for(site, args, len(sites)),
+                    intervals[site.key],
+                    args.heartbeat_hours,
+                    notify,
                 )
-        elif new_keys:
-            new_slots = [slot for slot in slots if slot.key in new_keys]
-            log.info("%d new slot(s): %s", len(new_slots), sorted(new_keys))
-            if notify:
-                delivered = deliver(
-                    format_slots(
-                        new_slots, f"{len(new_slots)} NEW slot(s) available:"
-                    )
-                    + f"\n\nBook here: {START_URL}"
-                )
-
-        if delivered:
-            seen |= current
-        save_state(args.state_file, {"seen": sorted(seen), "last_heartbeat": last_heartbeat})
-
-        heartbeat_due = (
-            last_heartbeat is None
-            or now() - datetime.fromisoformat(last_heartbeat)
-            >= timedelta(hours=args.heartbeat_hours)
-        )
-        if heartbeat_due:
-            if notify and not baseline:
-                delivered = deliver(
-                    format_slots(slots, f"Status: {len(slots)} slot(s) open right now:")
-                    if slots
-                    else "Status: no slots open right now."
-                )
-            if delivered:
-                last_heartbeat = now().isoformat()
-            save_state(
-                args.state_file,
-                {"seen": sorted(seen), "last_heartbeat": last_heartbeat},
-            )
-            log.info("heartbeat: %d slot(s) open", len(slots))
 
         if args.once:
-            return 0
+            return 0 if ok else 1
 
         if args.max_runtime and time.monotonic() - started >= args.max_runtime * 60:
             log.info("max runtime of %g min reached; state saved", args.max_runtime)
             return 0
 
-        time.sleep(args.interval + random.uniform(0, min(5.0, args.interval * 0.1)))
+        waits = [
+            max(0.0, trackers[site.key].next_poll - time.monotonic()) for site in sites
+        ]
+        time.sleep(min(waits) if waits else args.interval)
 
 
 if __name__ == "__main__":
