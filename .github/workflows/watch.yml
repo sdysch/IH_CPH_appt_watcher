@@ -11,10 +11,6 @@ on:
         description: 'How long to watch, in minutes (max ~350; job hard-caps at 360)'
         required: false
         default: '55'
-      poll_interval:
-        description: 'Seconds between polls'
-        required: false
-        default: '60'
 
 permissions:
   contents: write
@@ -31,7 +27,6 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       RUN_MINUTES: ${{ github.event.inputs.run_minutes || '55' }}
-      POLL_INTERVAL: ${{ github.event.inputs.poll_interval || '60' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,50 +34,30 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies
-        run: uv sync --frozen
-
       - name: Restore state
         continue-on-error: true
         run: |
-          if git fetch --depth=1 origin watcher-state; then
-            found=0
-            while read -r f; do
-              [ -n "$f" ] || continue
-              git show "FETCH_HEAD:$f" > "$f" && { echo "restored $f"; found=1; }
-            done <<EOF
-          $(git show FETCH_HEAD --name-only --pretty=format: | grep '^state' || true)
-          EOF
-            [ "$found" = 1 ] || echo "state branch had no state files"
-          else
-            echo "no prior state, starting fresh"
-          fi
+          git fetch --depth=1 origin watcher-state \
+            && git checkout FETCH_HEAD -- 'state-*.json' \
+            || echo "no prior state, starting fresh"
 
       - name: Watch for new slots
-        run: uv run python watcher.py --max-runtime "$RUN_MINUTES"
+        run: uv run --frozen python watcher.py --max-runtime "$RUN_MINUTES"
 
       - name: Persist state
         if: always()
-        env:
-          STATE_BRANCH: watcher-state
         run: |
-          set -eo pipefail
           shopt -s nullglob
           files=(state-*.json)
-          [ -f state.json ] && files+=(state.json)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "no state to persist"
-            exit 0
-          fi
-          tmp="$(mktemp -d)"
-          cp "${files[@]}" "$tmp/"
-          cd "$tmp"
-          git init -q
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .
-          git -c commit.gpgsign=false commit -q -m "watcher state $(date -u +%FT%TZ)"
-          git push --force \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "HEAD:refs/heads/${STATE_BRANCH}"
-          echo "state pushed to ${STATE_BRANCH}: ${files[*]}"
+          [ "${#files[@]}" -gt 0 ] || { echo "no state to persist"; exit 0; }
+          # Commit to a dedicated branch so main stays clean and the branch keeps a
+          # single commit. Pushes through origin, reusing the credential
+          # actions/checkout configured, and -f because state-*.json is gitignored.
+          # git reset clears the index so only the state files land in the commit.
+          git checkout --orphan watcher-state
+          git reset --quiet
+          git add -f -- "${files[@]}"
+          git -c commit.gpgsign=false commit -q \
+            -m "Update watcher state $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force origin HEAD:refs/heads/watcher-state
+          echo "pushed ${files[*]}"
